@@ -1,0 +1,45 @@
+import java.io.*;
+import java.util.Base64;
+import java.util.Vector;
+import javax.naming.Reference;
+import javax.naming.StringRefAddr;
+
+public class DeserializePayload {
+
+    public static void main(String[] args) {
+        try {
+            // The serialized data in Base64 (replace with your actual Base64 string)
+            String base64Data = "<BASE64 ENCODED SERIALIZED DATA>";
+
+            // Decode the Base64 data
+            byte[] data = Base64.getDecoder().decode(base64Data);
+
+            // Create an ObjectInputStream to read the serialized data
+            ByteArrayInputStream bais = new ByteArrayInputStream(data);
+            ObjectInputStream ois = new ObjectInputStream(bais);
+
+            // Read the object
+            Object obj = ois.readObject();
+
+            // Check if the object is an instance of Reference
+            if (obj instanceof Reference) {
+                Reference ref = (Reference) obj;
+                System.out.println("Deserialized Reference object:");
+                System.out.println("Class Name: " + ref.getClassName());
+
+                for (int i = 0; i < ref.size(); i++) {
+                    StringRefAddr addr = (StringRefAddr) ref.get(i);
+                    System.out.println("Type: " + addr.getType());
+                    System.out.println("Content: " + addr.getContent());
+                }
+            } else {
+                System.out.println("Deserialized object is not a Reference.");
+            }
+
+            ois.close();
+            bais.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
