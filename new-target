@@ -1,30 +1,79 @@
-#!/bin/bash
+#!/bin/zsh
 
-# Prompt for required variables
-read -p "Enter username: " user
-read -p "Enter password: " pass
-read -p "Enter IP address of Domain Controller: " ip
+SHELL_RC="$HOME/.zshrc"
 
-# Prompt for optional variables
-read -p "Enter domain (optional): " domain
-read -p "Enter FQDN (optional): " fqdn
-read -p "Enter Domain Controller hostname (dc_host) (optional): " dc_host
+# --- Ask if operator wants to remove existing target variables ---
+echo -n "Do you want to remove current target variables? (y/N): "
+read answer
 
-# Display the captured values
-echo -e "\n=== Summary of Entered Information ==="
+if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+    echo "🧹 Removing persistent variables from $SHELL_RC ..."
+    sed -i '/^export user=/d' "$SHELL_RC"
+    sed -i '/^export pass=/d' "$SHELL_RC"
+    sed -i '/^export ip=/d' "$SHELL_RC"
+    sed -i '/^export domain=/d' "$SHELL_RC"
+    sed -i '/^export fqdn=/d' "$SHELL_RC"
+    sed -i '/^export dc_host=/d' "$SHELL_RC"
+
+    unset user pass ip domain fqdn dc_host
+    source "$SHELL_RC"
+
+    echo "✅ All target variables have been removed and the shell reloaded."
+    echo "Try 'echo \$user' — it should now be empty."
+    exit 0
+fi
+
+# --- Prompt for new variables ---
+echo -n "Enter username: "
+read user
+echo -n "Enter password: "
+read pass
+echo -n "Enter IP address of Domain Controller: "
+read ip
+
+echo -n "Enter domain (optional): "
+read domain
+echo -n "Enter FQDN (optional): "
+read fqdn
+echo -n "Enter Domain Controller hostname (dc_host) (optional): "
+read dc_host
+
+# --- Clean up old variables first ---
+sed -i '/^export user=/d' "$SHELL_RC"
+sed -i '/^export pass=/d' "$SHELL_RC"
+sed -i '/^export ip=/d' "$SHELL_RC"
+sed -i '/^export domain=/d' "$SHELL_RC"
+sed -i '/^export fqdn=/d' "$SHELL_RC"
+sed -i '/^export dc_host=/d' "$SHELL_RC"
+
+# --- Write new variables ---
+{
+    echo "export user=\"$user\""
+    echo "export pass=\"$pass\""
+    echo "export ip=\"$ip\""
+    echo "export domain=\"$domain\""
+    echo "export fqdn=\"$fqdn\""
+    echo "export dc_host=\"$dc_host\""
+} >> "$SHELL_RC"
+
+# --- Reload environment ---
+source "$SHELL_RC"
+
+# --- Summary ---
+echo -e "\n=== Summary of Stored Information ==="
 echo "User:        $user"
 echo "Password:    $pass"
 echo "IP Address:  $ip"
-
-# Show optional variables only if they were set
 [ -n "$domain" ] && echo "Domain:      $domain"
 [ -n "$fqdn" ] && echo "FQDN:        $fqdn"
 [ -n "$dc_host" ] && echo "DC Host:     $dc_host"
 
-# Export variables so they can be used in this shell session
-export user pass ip domain fqdn dc_host
-
-echo -e "\nVariables have been exported. They can now be used like:"
-echo '  echo $user'
-echo '  echo $pass'
-echo '  echo $ip'
+echo -e "\n"
+echo "Variables are active now and will persist across reboots and new shells."
+echo "Test them now:"
+echo "  echo \$user"
+echo "  echo \$pass"
+echo "  echo \$ip"
+echo "  echo \$domain"
+echo "  echo \$fqdn"
+echo "  echo \$dc_host"
