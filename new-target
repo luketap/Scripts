@@ -46,14 +46,14 @@ sed -i '/^export domain=/d' "$SHELL_RC"
 sed -i '/^export fqdn=/d' "$SHELL_RC"
 sed -i '/^export dc_host=/d' "$SHELL_RC"
 
-# --- Write new variables ---
+# --- Write new variables with proper escaping ---
 {
-    echo "export user=\"$user\""
-    echo "export pass=\"$pass\""
-    echo "export ip=\"$ip\""
-    echo "export domain=\"$domain\""
-    echo "export fqdn=\"$fqdn\""
-    echo "export dc_host=\"$dc_host\""
+    printf 'export user=%q\n' "$user"
+    printf 'export pass=%q\n' "$pass"
+    printf 'export ip=%q\n' "$ip"
+    printf 'export domain=%q\n' "$domain"
+    printf 'export fqdn=%q\n' "$fqdn"
+    printf 'export dc_host=%q\n' "$dc_host"
 } >> "$SHELL_RC"
 
 # --- Reload environment ---
