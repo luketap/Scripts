@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# ctf-enum-tmux.sh — 2x2 tmux layout for repeatable CTF enumeration
+#
+# Panes:
+#   Top-left:    Nmap (3 concurrent scans)
+#   Top-right:   Gobuster (waits for nmap full output; extracts domain; /etc/hosts; dir + subdomain enum)
+#   Bottom-left: Nuclei (nuclei -u http://$ip)
+#   Bottom-right:Notes / spare shell
+#
+# Usage: ./ctf-enum-tmux.sh 10.10.10.10
+# Attach later: tmux attach -t enum_<ip>
+
+set -euo pipefail
+
+ip="${1:-}"
+if [[ -z "$ip" ]]; then
+  read -r -p "Target IP: " ip
+fi
+
+# deps
+for bin in tmux nmap gobuster nuclei; do
+  command -v "$bin" >/dev/null 2>&1 || { echo "[!] Missing dependency: $bin"; exit 1; }
+done
+
+# cache sudo once (so panes don't all prompt)
+sudo -v
+
+timestamp="$(date +%Y%m%d_%H%M%S)"
+outdir="enum_${ip}_${timestamp}"
+mkdir -p "$outdir"
+
+domain_file="$outdir/domain.txt"
+: > "$domain_file" || true
+
+wl_common="/usr/share/wordlists/dirb/common.txt"
+wl_big="/usr/share/wordlists/dirb/big.txt"
+sub_wl="/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt"
+
+session="enum_${ip//./_}"
+
+# --- helper scripts (written into outdir so they’re preserved) ---
+nmap_sh="$outdir/pane_nmap.sh"
+gobuster_sh="$outdir/pane_gobuster.sh"
+nuclei_sh="$outdir/pane_nuclei.sh"
+notes_sh="$outdir/pane_notes.sh"
+
+cat > "$nmap_sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+echo "[*] NMAP PANE"
+echo "[*] Target: $ip"
+echo "[*] Output: $outdir"
+
+sudo nmap "$ip" | tee "$outdir/nmap_simple.txt" &
+p1=\$!
+
+sudo nmap -sC -sV -p- "$ip" | tee "$outdir/nmap_full_sC_sV_p-.txt" &
+p2=\$!
+
+sudo nmap -sU --top-ports 100 "$ip" | tee "$outdir/nmap_udp_top100.txt" &
+p3=\$!
+
+wait "\$p1" || true
+wait "\$p2" || true
+wait "\$p3" || true
+
+echo "[*] NMAP DONE"
+exec bash
+EOF
+chmod +x "$nmap_sh"
+
+cat > "$gobuster_sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ip="__IP__"
+outdir="__OUTDIR__"
+domain_file="__DOMAIN_FILE__"
+
+wl_common="__WL_COMMON__"
+wl_big="__WL_BIG__"
+sub_wl="__SUB_WL__"
+
+echo "[*] GOBUSTER PANE"
+echo "[*] Output: $outdir"
+
+# Extract domain from more reliable sources than the nmap banner.
+extract_domain_from_nmap() {
+  local f="$1"
+
+  # Prefer redirect URLs
+  grep -Eo 'https?://([^/[:space:]]+)' "$f" 2>/dev/null \
+    | awk -F'//' '{print $2}' \
+    | grep -Eo '([A-Za-z0-9-]+\.)+[A-Za-z]{2,}' \
+    | grep -viE '^(nmap\.org)$' \
+    | head -n 1 && return 0
+
+  # Prefer SSL SANs (DNS:example.com)
+  grep -Eo 'DNS:([A-Za-z0-9-]+\.)+[A-Za-z]{2,}' "$f" 2>/dev/null \
+    | cut -d: -f2 \
+    | grep -viE '^(nmap\.org)$' \
+    | head -n 1 && return 0
+
+  # CN=example.com
+  grep -Eo 'commonName=([A-Za-z0-9-]+\.)+[A-Za-z]{2,}' "$f" 2>/dev/null \
+    | cut -d= -f2 \
+    | grep -viE '^(nmap\.org)$' \
+    | head -n 1 && return 0
+
+  return 1
+}
+
+run_gobuster_dir() {
+  local url="$1"
+  local wl="$2"
+  local out="$3"
+
+  # Use stable defaults; allow failures
+  gobuster dir -u "$url" -w "$wl" -o "$out" -q -t 30 --timeout 10s && return 0
+
+  # If wildcard detection is the failure, retry with --wildcard
+  if grep -qi "matches the provided options for non existing urls" "$out" 2>/dev/null; then
+    echo "[!] Wildcard-like responses detected for $url; retrying with --wildcard"
+    gobuster dir -u "$url" -w "$wl" -o "$out" -q -t 30 --timeout 10s --wildcard || true
+  fi
+}
+
+# Wait for full nmap output
+while [[ ! -s "$outdir/nmap_full_sC_sV_p-.txt" ]]; do
+  echo "[*] Waiting for nmap -sC/-sV output..."
+  sleep 2
+done
+
+nmap_full="$outdir/nmap_full_sC_sV_p-.txt"
+domain="$(extract_domain_from_nmap "$nmap_full" || true)"
+
+target_host="$ip"
+if [[ -n "$domain" ]]; then
+  echo "[*] Domain found: $domain"
+  echo "$domain" > "$domain_file"
+
+  if ! grep -qE "^[[:space:]]*${ip}[[:space:]]+${domain}([[:space:]]|\$)" /etc/hosts 2>/dev/null; then
+    echo "[*] Adding /etc/hosts: $ip $domain"
+    echo "$ip $domain" | sudo tee -a /etc/hosts >/dev/null
+  else
+    echo "[*] /etc/hosts already contains: $ip $domain"
+  fi
+  target_host="$domain"
+else
+  : > "$domain_file" || true
+  echo "[*] No domain detected; using IP."
+fi
+
+[[ -f "$wl_common" ]] || { echo "[!] Missing wordlist: $wl_common"; exec bash; }
+[[ -f "$wl_big"    ]] || { echo "[!] Missing wordlist: $wl_big"; exec bash; }
+
+for scheme in http https; do
+  url="${scheme}://${target_host}"
+  echo "[*] gobuster common => $url"
+  run_gobuster_dir "$url" "$wl_common" "$outdir/gobuster_${scheme}_common.txt"
+  echo "[*] gobuster big    => $url"
+  run_gobuster_dir "$url" "$wl_big"    "$outdir/gobuster_${scheme}_big.txt"
+done
+
+if [[ -n "$domain" && -f "$sub_wl" ]]; then
+  echo "[*] Subdomain enum => $domain"
+  gobuster dns -d "$domain" -w "$sub_wl" -o "$outdir/gobuster_dns_subdomains.txt" -q || true
+fi
+
+echo "[*] GOBUSTER DONE"
+exec bash
+EOF
+
+# substitute placeholders
+sed -i \
+  -e "s|__IP__|$ip|g" \
+  -e "s|__OUTDIR__|$outdir|g" \
+  -e "s|__DOMAIN_FILE__|$domain_file|g" \
+  -e "s|__WL_COMMON__|$wl_common|g" \
+  -e "s|__WL_BIG__|$wl_big|g" \
+  -e "s|__SUB_WL__|$sub_wl|g" \
+  "$gobuster_sh"
+chmod +x "$gobuster_sh"
+
+cat > "$nuclei_sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+echo "[*] NUCLEI PANE"
+echo "[*] Target: http://$ip"
+echo "[*] Output: $outdir"
+nuclei -u "http://$ip" | tee "$outdir/nuclei_http_ip.txt" || true
+echo "[*] NUCLEI DONE"
+exec bash
+EOF
+chmod +x "$nuclei_sh"
+
+cat > "$notes_sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+echo "[*] NOTES / SPARE"
+echo "Target: $ip"
+echo "Output: $outdir"
+echo
+echo "Useful:"
+echo "  ls -lah $outdir"
+echo "  sed -n '1,200p' $outdir/nmap_full_sC_sV_p-.txt"
+echo "  tail -n 50 $outdir/gobuster_http_common.txt 2>/dev/null || true"
+echo
+exec bash
+EOF
+chmod +x "$notes_sh"
+
+# --- start tmux session (fresh) ---
+tmux has-session -t "$session" 2>/dev/null && tmux kill-session -t "$session"
+
+tmux new-session -d -s "$session" -n "enum" "bash -lc '$nmap_sh'"
+
+# Split to 2x2 grid:
+# Start with left pane running nmap
+# Split right -> gobuster
+tmux split-window -h -t "$session:enum.0" "bash -lc '$gobuster_sh'"
+# Split bottom of left -> nuclei
+tmux split-window -v -t "$session:enum.0" "bash -lc '$nuclei_sh'"
+# Split bottom of right -> notes
+tmux split-window -v -t "$session:enum.1" "bash -lc '$notes_sh'"
+
+# Make it look like 2x2
+tmux select-layout -t "$session:enum" tiled >/dev/null 2>&1 || true
+
+echo "[*] tmux session: $session"
+echo "[*] output dir: $outdir"
+echo "[*] attach: tmux attach -t $session"
+tmux attach -t "$session"
