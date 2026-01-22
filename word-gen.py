@@ -27,16 +27,18 @@ from typing import Dict, Iterable, List, Tuple
 VERSION = "v1.1"
 
 BANNER = rf"""
- __      __                .___            ________               
-/  \    /  \___________  __| _/           /  _____/  ____   ____  
-\   \/\/   /  _ \_  __ \/ __ |    ______  /   \  ___ / __ \ /    \ 
+ __      __                .___            ________
+/  \    /  \___________  __| _/           /  _____/  ____   ____
+\   \/\/   /  _ \_  __ \/ __ |    ______  /   \  ___ / __ \ /    \
  \        (  <_> )  | \/ /_/ |   /_____/  \    \_\  \  ___/|   |  \
   \__/\  / \____/|__|  \____ |              \______  /\___  >___|  /
-       \/                   \/                     \/     \/     \/  
+       \/                   \/                     \/     \/     \/
+
 
   Wordlist Generator {VERSION}
 
-  
+  Author: Wir3Tap
+
 """
 
 DEFAULT_SUBS: Dict[str, List[str]] = {
@@ -165,10 +167,10 @@ def main() -> int:
         formatter_class=argparse.RawTextHelpFormatter,
         description=(
             "\n"
-            "Generate realistic password wordlists by expanding a base string"
-            "with capitalization, common character substitutions, and optional"
+            "Generate realistic password wordlists by expanding a base string "
+            "with capitalization, common character substitutions, and optional "
             "numeric or year-based suffix expansion.\n"
-            "Designed for security testing, password auditing, and controlled"
+            "Designed for security testing, password auditing, and controlled "
             "credential recovery workflows."
             "\n"
         )
