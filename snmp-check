@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+
+import subprocess
+import concurrent.futures
+import argparse
+import sys
+import time
+from typing import List, Tuple, Set
+
+DEFAULT_COMMUNITIES = [
+    "public",
+    "private",
+    "manager",
+    "admin",
+    "cisco",
+    "community"
+]
+
+OID = "1.3.6.1.2.1.1.1.0"  # sysDescr.0
+DEFAULT_VERSIONS = ["1", "2c", "3"]
+DEFAULT_V3_USERS = ["admin", "snmpuser", "snmpadmin"]
+
+
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    CYAN_BG = "\033[46m"
+
+    DIM = "\033[2m"
+
+
+def color(text: str, c: str) -> str:
+    return f"{c}{text}{Colors.RESET}"
+
+
+def configure_terminal_output() -> None:
+    """Use UTF-8 for the Braille spinner, with graceful fallback support."""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (LookupError, OSError):
+            pass
+
+
+def banner():
+    art = rf"""
+{Colors.CYAN}{Colors.BOLD}
+   _______   ____  ________      ________              __
+  / ___/ /  / /  |/  / __ \    / ____/ /_  ___  _____/ /__
+  \__ \/ / / / /|_/ / /_/ /   / /   / __ \/ _ \/ ___/ //_/
+ ___/ / /_/ / /  / / ____/   / /___/ / / /  __/ /__/ ,<
+/____/\____/_/  /_/_/        \____/_/ /_/\___/\___/_/|_|
+{Colors.RESET}
+{color('           SNMP Version and Credential Validator', Colors.MAGENTA)}
+{color('           ------------------------------------------------', Colors.DIM)}
+"""
+    print(art)
+
+
+def print_status(tag: str, message: str, tag_color: str = Colors.BLUE):
+    print(f"{color(f'[{tag}]', tag_color)} {message}")
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def clear_progress() -> None:
+    sys.stdout.write("\r" + " " * 140 + "\r")
+    sys.stdout.flush()
+
+
+def render_progress(
+    completed: int,
+    total: int,
+    hits: int,
+    started_at: float,
+    frame: int,
+    width: int = 30,
+) -> None:
+    ratio = completed / total if total else 1.0
+    filled = min(width, int(width * ratio))
+    empty = width - filled
+
+    # Background-colored spaces create a smooth bar without Unicode block
+    # characters, which are not supported by every Windows console encoding.
+    filled_bar = f"{Colors.CYAN_BG}{' ' * filled}{Colors.RESET}" if filled else ""
+    bar = f"{filled_bar}{' ' * empty}"
+
+    elapsed = time.monotonic() - started_at
+    rate = completed / elapsed if elapsed > 0 else 0
+    eta = (total - completed) / rate if rate > 0 else 0
+    braille_orbit = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    ascii_orbit = ("|", "/", "-", "\\")
+    try:
+        "⠋".encode(sys.stdout.encoding or "ascii")
+        orbit = braille_orbit
+    except (UnicodeEncodeError, LookupError):
+        orbit = ascii_orbit
+    pulse = orbit[frame % len(orbit)]
+    if completed >= total:
+        pulse = "✓" if orbit is braille_orbit else "*"
+
+    sys.stdout.write(
+        f"\r{color(pulse, Colors.WHITE)} [{bar}] "
+        f"{color(f'{ratio * 100:6.2f}%', Colors.GREEN)} "
+        f"{completed:,}/{total:,} | "
+        f"{color(f'{hits} hits', Colors.YELLOW)} | "
+        f"{rate:,.1f} probes/s | ETA {format_duration(eta)}"
+    )
+    sys.stdout.flush()
+
+
+def run_snmpwalk(ip: str, version: str, credentials: List[str], timeout: int) -> Tuple[bool, str]:
+    cmd = [
+        "snmpwalk",
+        f"-v{version}",
+        *credentials,
+        "-t", str(timeout),
+        "-r", "0",
+        ip,
+        OID
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 2
+        )
+
+        output = (result.stdout or result.stderr).strip()
+
+        if result.returncode == 0 and output:
+            return True, output
+
+        return False, output
+
+    except subprocess.TimeoutExpired:
+        return False, "Timed out"
+    except FileNotFoundError:
+        return False, "snmpwalk not found in PATH"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+
+def v3_credentials(args, username: str) -> List[str]:
+    credentials = ["-u", username]
+    if args.v3_priv_password:
+        credentials.extend([
+            "-l", "authPriv", "-a", args.v3_auth_protocol,
+            "-A", args.v3_auth_password, "-x", args.v3_priv_protocol,
+            "-X", args.v3_priv_password,
+        ])
+    elif args.v3_auth_password:
+        credentials.extend([
+            "-l", "authNoPriv", "-a", args.v3_auth_protocol,
+            "-A", args.v3_auth_password,
+        ])
+    else:
+        credentials.extend(["-l", "noAuthNoPriv"])
+    if args.v3_context:
+        credentials.extend(["-n", args.v3_context])
+    return credentials
+
+
+def build_probes(hosts, versions, communities, v3_users, args):
+    probes = []
+    for ip in hosts:
+        for version in versions:
+            if version in ("1", "2c"):
+                for community in communities:
+                    probes.append((ip, version, community, ["-c", community]))
+            else:
+                for username in v3_users:
+                    probes.append((ip, version, username, v3_credentials(args, username)))
+    return probes
+
+
+def load_hosts(file_path: str) -> List[str]:
+    with open(file_path, "r") as f:
+        return [
+            line.strip()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+
+def write_matching_hosts(file_path: str, hosts: Set[str]) -> None:
+    with open(file_path, "w") as f:
+        for host in sorted(hosts):
+            f.write(f"{host}\n")
+
+
+def main():
+    configure_terminal_output()
+
+    parser = argparse.ArgumentParser(
+        description="SNMP v1, v2c, and v3 credential validator for a host list"
+    )
+    parser.add_argument(
+        "-f", "--file",
+        required=True,
+        help="File containing hosts (one per line)"
+    )
+    parser.add_argument(
+        "-c", "--community",
+        action="append",
+        dest="communities",
+        help="Custom community string (can be used multiple times)"
+    )
+    parser.add_argument(
+        "-V", "--version", action="append", dest="versions",
+        choices=["1", "2c", "3"],
+        help="SNMP version to test (repeatable; default: 1, 2c, and 3)"
+    )
+    parser.add_argument(
+        "--v3-user", action="append", dest="v3_users",
+        help="SNMPv3 security name/username (repeatable)"
+    )
+    parser.add_argument("--v3-auth-password", help="SNMPv3 authentication password")
+    parser.add_argument(
+        "--v3-auth-protocol", choices=["MD5", "SHA", "SHA-224", "SHA-256", "SHA-384", "SHA-512"],
+        default="SHA", help="SNMPv3 authentication protocol (default: SHA)"
+    )
+    parser.add_argument("--v3-priv-password", help="SNMPv3 privacy password (requires --v3-auth-password)")
+    parser.add_argument(
+        "--v3-priv-protocol", choices=["DES", "AES", "AES-192", "AES-256"],
+        default="AES", help="SNMPv3 privacy protocol (default: AES)"
+    )
+    parser.add_argument("--v3-context", help="Optional SNMPv3 context name")
+    parser.add_argument(
+        "-t", "--timeout",
+        type=int,
+        default=2,
+        help="Timeout per request in seconds (default: 2)"
+    )
+    parser.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=32,
+        help="Number of worker threads (default: 32)"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Write hosts with at least one valid SNMP credential to this file"
+    )
+
+    args = parser.parse_args()
+
+    if args.v3_priv_password and not args.v3_auth_password:
+        parser.error("--v3-priv-password requires --v3-auth-password")
+
+    banner()
+
+    communities = args.communities if args.communities else DEFAULT_COMMUNITIES
+    versions = args.versions if args.versions else DEFAULT_VERSIONS
+    v3_users = args.v3_users if args.v3_users else DEFAULT_V3_USERS
+    hosts = load_hosts(args.file)
+
+    print_status("INFO", f"Loaded {color(str(len(hosts)), Colors.BOLD)} hosts from {color(args.file, Colors.CYAN)}")
+    print_status("INFO", f"Testing communities: {color(', '.join(communities), Colors.YELLOW)}")
+    print_status("INFO", f"Testing SNMP versions: {color(', '.join(versions), Colors.YELLOW)}")
+    if "3" in versions:
+        print_status("INFO", f"Testing SNMPv3 users: {color(', '.join(v3_users), Colors.YELLOW)}")
+    print()
+
+    findings = []
+    matching_hosts = set()
+    probes = build_probes(hosts, versions, communities, v3_users, args)
+
+    completed_probes = 0
+    frame = 0
+    started_at = time.monotonic()
+    render_progress(completed_probes, len(probes), 0, started_at, frame)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_map = {
+                executor.submit(run_snmpwalk, ip, version, credentials, args.timeout):
+                (ip, version, identity)
+                for ip, version, identity, credentials in probes
+            }
+            pending = set(future_map)
+
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=0.1,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                frame += 1
+
+                for future in done:
+                    ip, version, identity = future_map[future]
+                    try:
+                        success, output = future.result()
+                        if success:
+                            matching_hosts.add(ip)
+                            findings.append((ip, version, identity, output))
+                            clear_progress()
+                            print(
+                                f"{color('[FOUND]', Colors.GREEN)} "
+                                f"{color(ip, Colors.BOLD)} "
+                                f"accepted SNMPv{color(version, Colors.CYAN)} "
+                                f"{'user' if version == '3' else 'community'} "
+                                f"{color(repr(identity), Colors.YELLOW)}"
+                            )
+                            print(f"        {color(output, Colors.DIM)}")
+                    except Exception as e:
+                        clear_progress()
+                        print(f"{color('[ERROR]', Colors.RED)} {ip}: {e}")
+                    finally:
+                        completed_probes += 1
+
+                render_progress(
+                    completed_probes,
+                    len(probes),
+                    len(findings),
+                    started_at,
+                    frame,
+                )
+
+    finally:
+        clear_progress()
+        render_progress(
+            completed_probes,
+            len(probes),
+            len(findings),
+            started_at,
+            frame,
+        )
+        print()
+
+    print()
+    print(color("=" * 68, Colors.CYAN))
+    print_status("DONE", f"Valid findings: {color(str(len(findings)), Colors.GREEN)}", Colors.GREEN)
+    print_status("DONE", f"Hosts with at least one valid credential: {color(str(len(matching_hosts)), Colors.GREEN)}", Colors.GREEN)
+
+    sensitive_hits = {}
+    for host, version, identity, _output in findings:
+        normalized_identity = identity.lower()
+        if normalized_identity in {"admin", "private"}:
+            sensitive_hits.setdefault(host, set()).add((normalized_identity, version))
+
+    print_status(
+        "SUMMARY",
+        f"Hosts accepting 'admin' or 'private': "
+        f"{color(str(len(sensitive_hits)), Colors.YELLOW)}",
+        Colors.MAGENTA,
+    )
+    if sensitive_hits:
+        for host in sorted(sensitive_hits):
+            annotations = ", ".join(
+                f"{identity} (SNMPv{version})"
+                for identity, version in sorted(sensitive_hits[host])
+            )
+            print(
+                f"          {color(host, Colors.YELLOW)} - "
+                f"accepted {color(annotations, Colors.BOLD)}"
+            )
+    else:
+        print(f"          {color('None', Colors.DIM)}")
+
+    if args.output:
+        write_matching_hosts(args.output, matching_hosts)
+        print_status("SAVE", f"Wrote matching hosts to: {color(args.output, Colors.CYAN)}", Colors.MAGENTA)
+
+    print(color("=" * 68, Colors.CYAN))
+    print()
+
+
+if __name__ == "__main__":
+    main()
